@@ -3,14 +3,18 @@ FROM docker.io/library/alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50
 # A minimal HTTP CONNECT proxy for a VPN-gateway sidecar: CONNECT to
 # :443/:80 only, global-unicast IPv4 targets only, non-root, no per-request
 # logging. See proxy.py for the full contract.
-ARG PROXY_VERSION=1.0.0
+ARG PROXY_VERSION=1.0.1
 
 RUN addgroup -g 1000 proxy \
  && adduser -D -H -u 1000 -G proxy -s /sbin/nologin proxy \
  && apk add --no-cache python3 \
  && [ "$(id -u proxy)" = "1000" ] \
- && python3 -c 'import ipaddress, select, socket, threading'
+ && python3 -c 'import ipaddress, select, socket, threading' \
+ && install -d -m 0755 /app
 
+# The directory is created above with an explicit mode: COPY --chmod applies
+# its mode to a directory it has to create too, and a 0444 /app is not
+# traversable by uid 1000 (the process could not open its own script).
 COPY --chmod=0444 proxy.py /app/proxy.py
 
 USER 1000:1000

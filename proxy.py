@@ -8,16 +8,18 @@ Deliberately small and strict, because its input is an untrusted browser:
   - Target ports 443 and 80 only.
   - The target hostname is resolved with the container's own resolver (in
     the intended deployment, the VPN container's DNS-over-TLS forwarder on
-    127.0.0.1), and EVERY address it resolves to must be a global unicast
-    IPv4 address. Loopback, private (RFC 1918), link-local, carrier-grade
-    NAT (100.64/10), multicast, reserved, unspecified and all IPv6 are
-    refused — a browser behind this proxy cannot reach the host, the
-    cluster, or the LAN through it. The connection is made to the vetted
-    address, never by re-resolving the name (no rebinding window).
+    127.0.0.1), asking for IPv4 answers only, and EVERY address it resolves
+    to must be a global unicast IPv4 address. Loopback, private (RFC 1918),
+    link-local, carrier-grade NAT (100.64/10), multicast, reserved and
+    unspecified addresses are refused — a browser behind this proxy cannot
+    reach the host, the cluster, or the LAN through it. The connection is
+    made to the vetted address, never by re-resolving the name (no
+    rebinding window). IPv6 is never dialled.
   - No authentication: who may reach the listener is the network policy's
     job, not this process's.
-  - Bounded: request line / header size, concurrent connection count, idle
-    timeout on both directions, and a hard cap on the CONNECT handshake.
+  - Bounded: request head size, concurrent connection count, idle timeout
+    on both directions, and an ABSOLUTE deadline on the CONNECT handshake
+    (a client trickling one byte per timeout cannot hold a slot open).
   - Logs NOTHING per request — not the host, not the port, not the client.
     A proxy log is a browsing history. Startup and refusal COUNTS only.
 
@@ -41,6 +43,7 @@ ALLOWED_PORTS = (443, 80)
 MAX_HEADER_BYTES = 8192
 MAX_HOST_LEN = 253
 RELAY_BUF = 65536
+MAX_PENDING = 4 * RELAY_BUF  # per direction, before the reading side is paused
 
 _sem = threading.BoundedSemaphore(MAX_CONNECTIONS)
 _stats = {"accepted": 0, "relayed": 0, "refused": 0, "failed": 0}
@@ -60,13 +63,24 @@ def send(sock, status, reason):
 
 
 def read_request(sock):
-    """Read the CONNECT request head (bounded). Returns bytes or None."""
-    sock.settimeout(CONNECT_TIMEOUT)
+    """Read the CONNECT request head (bounded). Returns bytes or None.
+
+    The bound is an absolute deadline of CONNECT_TIMEOUT from the first
+    call, not a per-recv timeout: a per-recv timeout lets a client that
+    sends one byte every few seconds hold a connection slot for hours."""
+    deadline = time.monotonic() + CONNECT_TIMEOUT
     data = b""
     while b"\r\n\r\n" not in data:
         if len(data) >= MAX_HEADER_BYTES:
             return None
-        chunk = sock.recv(min(4096, MAX_HEADER_BYTES - len(data)))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(min(4096, MAX_HEADER_BYTES - len(data)))
+        except OSError:  # timeout (TimeoutError is an OSError), reset, …
+            return None
         if not chunk:
             return None
         data += chunk
@@ -97,17 +111,17 @@ def parse_target(head):
         return None
     if not all(c.isalnum() or c in "-." for c in host):
         return None
-    if host.split(".")[-1].isdigit():
-        # An IP literal — vetted like any other address below, but a
-        # dotted-quad that is NOT global unicast is refused there.
-        pass
     return host, port
 
 
 def vet(host):
-    """Resolve and return ONE global-unicast IPv4 address, or None."""
+    """Resolve (IPv4 only) and return ONE global-unicast IPv4 address, or None."""
     try:
-        infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        # AF_INET: ask the resolver for A records only. A dual-stack site's
+        # AAAA answer must not poison an otherwise-global name (this proxy
+        # never dials IPv6 anyway); the version check below stays as a
+        # belt-and-braces guard on what the resolver hands back.
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
     except (socket.gaierror, UnicodeError, OSError):
         return None
     if not infos:
@@ -118,8 +132,8 @@ def vet(host):
             ip = ipaddress.ip_address(sockaddr[0])
         except ValueError:
             return None
-        # Any non-global or non-IPv4 answer poisons the whole name: a name
-        # that resolves to a private address alongside a public one is a
+        # Any non-global answer poisons the whole name: a name that
+        # resolves to a private address alongside a public one is a
         # rebinding/dual-answer trick, not a legitimate site.
         if ip.version != 4 or not ip.is_global or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
             return None
@@ -129,20 +143,39 @@ def vet(host):
 
 
 def relay(a, b):
-    """Bidirectional copy until either side closes or idles out."""
+    """Bidirectional copy until either side closes or idles out.
+
+    Non-blocking on both sides, with select() driving BOTH readability and
+    writability: bytes read from one side wait in a per-direction buffer
+    until the other side can take them, and a side whose peer's buffer is
+    full is simply not read until it drains (backpressure, bounded to
+    MAX_PENDING per direction). Never calls sendall on a non-blocking
+    socket — that raised BlockingIOError the moment a slow reader's window
+    filled and tore down every large download — and never blocks in a
+    write, so two heavy directions cannot deadlock each other."""
     a.setblocking(False)
     b.setblocking(False)
-    socks = [a, b]
+    other = {a: b, b: a}
+    pending = {a: b"", b: b""}  # bytes waiting to be written TO that socket
     last = time.monotonic()
     while True:
         remaining = IDLE_TIMEOUT - (time.monotonic() - last)
         if remaining <= 0:
             return
-        readable, _, errored = select.select(socks, [], socks, min(remaining, 30))
+        want_r = [s for s in (a, b) if len(pending[other[s]]) < MAX_PENDING]
+        want_w = [s for s in (a, b) if pending[s]]
+        readable, writable, errored = select.select(want_r, want_w, [a, b], min(remaining, 30))
         if errored:
             return
-        if not readable:
-            continue
+        for s in writable:
+            try:
+                n = s.send(pending[s])
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return
+            pending[s] = pending[s][n:]
+            last = time.monotonic()
         for s in readable:
             try:
                 data = s.recv(RELAY_BUF)
@@ -151,12 +184,8 @@ def relay(a, b):
             except OSError:
                 return
             if not data:
-                return
-            other = b if s is a else a
-            try:
-                other.sendall(data)
-            except OSError:
-                return
+                return  # either side closing ends the tunnel (no half-close semantics for TLS)
+            pending[other[s]] += data
             last = time.monotonic()
 
 
@@ -178,7 +207,7 @@ def handle(client):
         ip = vet(host)
         if ip is None:
             bump("refused")
-            send(client, 403, "Forbidden")  # non-global, IPv6, or unresolvable
+            send(client, 403, "Forbidden")  # non-global or unresolvable
             return
         try:
             upstream = socket.create_connection((ip, port), timeout=CONNECT_TIMEOUT)
@@ -188,13 +217,13 @@ def handle(client):
             return
         try:
             client.sendall(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: connect-proxy\r\n\r\n")
+            # Anything after the head belongs to the tunnel (TLS ClientHello).
+            rest = head.split(b"\r\n\r\n", 1)[1]
+            if rest:
+                upstream.sendall(rest)
         except OSError:
             return
         bump("relayed")
-        # Anything after the head belongs to the tunnel (TLS ClientHello).
-        rest = head.split(b"\r\n\r\n", 1)[1]
-        if rest:
-            upstream.sendall(rest)
         relay(client, upstream)
     finally:
         for s in (client, upstream):
